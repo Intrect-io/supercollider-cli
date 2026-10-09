@@ -1,0 +1,383 @@
+<!doctype html>
+<!-- Created: 2026-09-15
+     Purpose: Single-page remote UI -- listen to scsynth output and drive it.
+     Two audio paths:
+       * realtime: WebSocket /ws streaming raw float32 PCM, played by an
+         AudioWorklet with a ~100 ms buffer. This is the primary path, so
+         control changes are heard almost immediately.
+       * mp3: the /audio MP3 stream as a fallback (works in any browser).
+     Served by scweb.py. No external assets, no build step. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>scsynth remote</title>
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f26; --line: #2b3038;
+    --fg: #e6e9ee; --dim: #8b94a3; --accent: #6ee7b7; --warn: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  header {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0;
+  }
+  h1 { font-size: 14px; margin: 0; font-weight: 600; letter-spacing: .04em; }
+  .spacer { flex: 1; }
+  .stat { color: var(--dim); font-size: 12px; }
+  .stat b { color: var(--fg); font-weight: 600; }
+  button {
+    background: #262b34; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit; font-size: 13px;
+  }
+  button:hover { border-color: #3d4552; }
+  button.on { background: var(--accent); color: #0b1410; border-color: var(--accent); }
+  button.danger:hover { border-color: var(--warn); color: var(--warn); }
+  main { padding: 18px; max-width: 900px; margin: 0 auto; }
+  section { margin-bottom: 22px; }
+  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .row + .row { margin-top: 8px; }
+  input, select {
+    background: #10131a; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 9px; font: inherit; font-size: 13px;
+  }
+  input[type=range] { padding: 0; border: 0; background: none; width: 150px; }
+  label { color: var(--dim); font-size: 12px; }
+  .hint { color: var(--dim); font-size: 12px; margin-top: 6px; }
+  .mode { font-size: 11px; border: 1px solid var(--line); border-radius: 4px; padding: 2px 7px; }
+  .mode.rt { color: var(--accent); border-color: var(--accent); }
+  .node {
+    border: 1px solid var(--line); border-radius: 8px; background: var(--panel);
+    padding: 10px 12px; margin-bottom: 8px;
+  }
+  .node-head { display: flex; align-items: center; gap: 10px; }
+  .id { color: var(--accent); }
+  .def { font-weight: 600; }
+  .ctl { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+  .ctl span { color: var(--dim); min-width: 56px; font-size: 12px; }
+  .ctl output { min-width: 62px; text-align: right; font-size: 12px; }
+  .empty { color: var(--dim); font-style: italic; }
+  .err { color: var(--warn); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>scsynth remote</h1>
+  <button id="stream">▶ listen</button>
+  <span class="mode" id="mode" hidden></span>
+  <audio id="audio" preload="none" hidden></audio>
+  <span class="spacer"></span>
+  <span class="stat" id="stat">connecting…</span>
+  <button id="freeall" class="danger">free all</button>
+</header>
+
+<main>
+  <section>
+    <div class="row">
+      <label for="def">launch</label>
+      <select id="def"></select>
+      <input id="k" placeholder="param" size="8">
+      <input id="v" placeholder="value" size="8">
+      <button id="play">play</button>
+      <button id="addparam">+ param</button>
+    </div>
+    <div class="row" id="params"></div>
+    <p class="hint">
+      Real-time path sends raw PCM over WebSocket (~100 ms end-to-end), so slider
+      moves are heard immediately. MP3 fallback buffered seconds behind is used
+      only if the WebSocket can't connect.
+    </p>
+  </section>
+
+  <section id="tree"></section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let extraParams = [];
+
+// ---- realtime audio: WebSocket PCM -> AudioWorklet ----------------------
+// The server streams interleaved float32 (L,R) at 48000 Hz. The worklet keeps a
+// small buffer (~100 ms) and plays it at the same rate the server sends it, so
+// there is no drift and no multi-second buffering.
+const WORKLET_SRC = `
+class RealtimePlayer extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.buf = new Float32Array(0);
+    this.pos = 0;
+    this.port.onmessage = (e) => this.push(e.data);
+  }
+  push(data) {
+    const f = new Float32Array(data);            // interleaved L,R
+    const keep = this.buf.length - this.pos;
+    const merged = new Float32Array(keep + f.length);
+    if (keep > 0) merged.set(this.buf.subarray(this.pos));
+    merged.set(f, keep);
+    this.buf = merged;
+    this.pos = 0;
+    // hard cap ~0.5 s of buffering so a burst can never lag us far behind
+    const max = 48000 * 0.5 * 2;
+    if (this.buf.length > max) {
+      this.buf = this.buf.subarray(-max);
+    }
+  }
+  process(inputs, outputs) {
+    const chans = outputs[0];
+    if (!chans) return true;
+    const n = chans[0].length;
+    const avail = (this.buf.length - this.pos) >> 1;
+    const m = Math.min(n, avail);
+    for (let i = 0; i < m; i++) {
+      chans[0][i] = this.buf[this.pos + i * 2];
+      chans[1][i] = this.buf[this.pos + i * 2 + 1];
+    }
+    for (let i = m; i < n; i++) { chans[0][i] = 0; chans[1][i] = 0; }
+    this.pos += m * 2;
+    return true;
+  }
+}
+registerProcessor('realtime-player', RealtimePlayer);
+`;
+const WORKLET_URL = URL.createObjectURL(new Blob([WORKLET_SRC], { type: "application/javascript" }));
+
+let rtCtx = null, rtNode = null, rtWs = null;
+
+async function startRealtime() {
+  if (rtCtx) return true;
+  try {
+    rtCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+    await rtCtx.audioWorklet.addModule(WORKLET_URL);
+    rtNode = new AudioWorkletNode(rtCtx, "realtime-player");
+    rtNode.connect(rtCtx.destination);
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    rtWs = new WebSocket(proto + "//" + location.host + "/ws");
+    rtWs.binaryType = "arraybuffer";
+    rtWs.onmessage = (e) => rtNode.port.postMessage(e.data, [e.data]); // zero-copy
+    await new Promise((ok, fail) => {
+      rtWs.onopen = ok;
+      setTimeout(() => fail(new Error("ws timeout")), 4000);
+    });
+    await rtCtx.resume();
+    return true;
+  } catch (err) {
+    stopRealtime();
+    return false;
+  }
+}
+
+function stopRealtime() {
+  if (rtWs) { try { rtWs.close(); } catch (e) {} rtWs = null; }
+  if (rtNode) { try { rtNode.disconnect(); } catch (e) {} rtNode = null; }
+  if (rtCtx) { try { rtCtx.close(); } catch (e) {} rtCtx = null; }
+}
+
+function setMode(m) {
+  const el = $("mode");
+  el.hidden = false;
+  el.textContent = m === "rt" ? "realtime ~100ms" : "mp3 fallback";
+  el.className = "mode " + m;
+}
+
+// ---- stream toggle: try realtime first, fall back to MP3 -----------------
+let streamOn = false;
+
+$("stream").onclick = async () => {
+  if (streamOn) { offStream(); return; }
+
+  if (await startRealtime()) {
+    setMode("rt");
+  } else {
+    const audio = $("audio");
+    audio.src = "/audio?" + Date.now();
+    audio.play().catch(e => flash("mp3 failed: " + e.message));
+    setMode("mp3");
+  }
+  $("stream").textContent = "■ stop";
+  $("stream").classList.add("on");
+  streamOn = true;
+};
+
+function offStream() {
+  streamOn = false;
+  stopRealtime();
+  const audio = $("audio");
+  audio.pause();
+  audio.removeAttribute("src");
+  $("stream").textContent = "▶ listen";
+  $("stream").classList.remove("on");
+  $("mode").hidden = true;
+}
+
+// ---- extra param rows ---------------------------------------------------
+function renderParams() {
+  const box = $("params");
+  box.innerHTML = "";
+  extraParams.forEach((p, i) => {
+    const row = document.createElement("div");
+    row.className = "row";
+    row.innerHTML = `<label>${p.k || "(param)"}</label><input value="${p.v}" size="8">` +
+                    `<button class="danger">remove</button>`;
+    row.querySelector("input").oninput = (e) => { extraParams[i].v = e.target.value; };
+    row.querySelector("button").onclick = () => { extraParams.splice(i, 1); renderParams(); };
+    box.appendChild(row);
+  });
+}
+$("addparam").onclick = () => {
+  extraParams.push({ k: "", v: "" });
+  renderParams();
+  const inputs = $("params").querySelectorAll("input");
+  if (inputs.length) inputs[inputs.length - 1].focus();
+};
+
+function collectParams() {
+  const params = {};
+  const push = (k, v) => {
+    k = (k || "").trim();
+    if (!k || v === "" || v === undefined) return;
+    const n = Number(v);
+    params[k] = Number.isNaN(n) ? v : n;
+  };
+  push($("k").value, $("v").value);
+  extraParams.forEach(p => push(p.k, p.v));
+  return params;
+}
+
+// ---- control calls ------------------------------------------------------
+async function post(path, body) {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+$("play").onclick = async () => {
+  try {
+    await post("/api/play", { def: $("def").value, params: collectParams() });
+    refresh();
+  } catch (e) { flash(e.message); }
+};
+$("freeall").onclick = async () => {
+  try { await post("/api/freeall"); refresh(); } catch (e) { flash(e.message); }
+};
+
+let errTimer = null;
+function flash(msg) {
+  const el = $("stat");
+  el.innerHTML = `<span class="err">${msg}</span>`;
+  clearTimeout(errTimer);
+  errTimer = setTimeout(refresh, 2500);
+}
+
+// ---- state polling ------------------------------------------------------
+// A slider being dragged must not be stomped by the next poll.
+function isEditing(el) { return el && el.contains(document.activeElement) &&
+                                document.activeElement.type === "range"; }
+
+function renderTree(tree) {
+  const box = $("tree");
+  const synths = [];
+  (function walk(n) {
+    if (!n) return;
+    if (n.type === "synth") synths.push(n);
+    (n.children || []).forEach(walk);
+  })(tree);
+
+  if (!synths.length) {
+    box.innerHTML = '<p class="empty">no synths running</p>';
+    return;
+  }
+
+  const existing = new Map([...box.querySelectorAll(".node")].map(n => [+n.dataset.id, n]));
+  const seen = new Set();
+
+  for (const s of synths) {
+    seen.add(s.id);
+    let node = existing.get(s.id);
+    if (!node) {
+      node = document.createElement("div");
+      node.className = "node";
+      node.dataset.id = s.id;
+      node.innerHTML = `<div class="node-head"><span class="id">#${s.id}</span>` +
+                       `<span class="def">${s.def}</span><span class="spacer"></span>` +
+                       `<button class="danger">free</button></div>`;
+      node.querySelector("button").onclick = async () => {
+        try { await post("/api/free", { id: s.id }); refresh(); } catch (e) { flash(e.message); }
+      };
+      box.appendChild(node);
+    }
+    if (isEditing(node)) continue;
+
+    const ctlBox = node.querySelector(".ctls") || node.appendChild(
+      Object.assign(document.createElement("div"), { className: "ctls" }));
+    ctlBox.innerHTML = "";
+    for (const [k, v] of Object.entries(s.controls || {})) {
+      const row = document.createElement("div");
+      row.className = "ctl";
+      const isFreq = /freq|rate|pitch/i.test(k);
+      const min = isFreq ? 20 : 0, max = isFreq ? 4000 : Math.max(1, Math.abs(v) * 4);
+      row.innerHTML = `<span>${k}</span>` +
+        `<input type="range" min="${min}" max="${max}" step="${isFreq ? 1 : 0.001}" value="${v}">` +
+        `<output>${(+v).toFixed(2)}</output>`;
+      const slider = row.querySelector("input");
+      const out = row.querySelector("output");
+      slider.oninput = () => { out.textContent = (+slider.value).toFixed(2); };
+      slider.onchange = async () => {
+        try { await post("/api/set", { id: s.id, params: { [k]: +slider.value } }); }
+        catch (e) { flash(e.message); }
+      };
+      ctlBox.appendChild(row);
+    }
+  }
+
+  for (const [id, node] of existing) if (!seen.has(id)) node.remove();
+  synths.forEach(s => {
+    const n = box.querySelector(`.node[data-id="${s.id}"]`);
+    if (n) box.appendChild(n);
+  });
+}
+
+function renderDefs(defs) {
+  const sel = $("def");
+  const want = defs.join(",");
+  if (sel.dataset.list === want) return;
+  sel.dataset.list = want;
+  const prev = sel.value;
+  sel.innerHTML = defs.map(d => `<option value="${d}">${d}</option>`).join("");
+  if (defs.includes(prev)) sel.value = prev;
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("/api/state");
+    const j = await r.json();
+    const st = j.status;
+    if (st) {
+      $("stat").innerHTML =
+        `synths <b>${st.numSynths}</b> · defs <b>${st.numSynthDefs}</b> · ` +
+        `cpu <b>${(+st.avgCPU).toFixed(1)}%</b> · ${Math.round(st.actualSampleRate)} Hz`;
+    } else {
+      $("stat").innerHTML = '<span class="err">no reply from scsynth</span>';
+    }
+    renderDefs(j.defs || []);
+    renderTree(j.tree);
+  } catch (e) {
+    $("stat").innerHTML = `<span class="err">${e.message}</span>`;
+  }
+}
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

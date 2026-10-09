@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# render outputs and scratch artifacts
+testing/out/
+*.osc
+*.wav
+*.aiff
+
+trash/
+
+# local-only working notes (not published)
+CLAUDE.md
+plan.md

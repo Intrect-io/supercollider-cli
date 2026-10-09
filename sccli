@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+# Created: 2026-09-15
+# Purpose: Minimal OSC control surface for a running scsynth -- the headless
+#          control layer. Talks scsynth's native protocol directly (no sclang).
+# Dependencies: none (stdlib only); OSC implementation lives in sclib.py
+# Test Status: verified 2026-09-15 against a realtime scsynth on udp/57210
+#
+# Note: zero third-party deps, so the shebang stays portable. The repo's venv
+# (~/dev/venvs/supercollider-cli) exists for convention and for future deps.
+
+import argparse
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sclib import DEFAULT_HOST, DEFAULT_PORT, SCClient  # noqa: E402
+
+REPO = os.path.dirname(os.path.abspath(__file__))
+
+
+def parse_kv(pairs):
+    """['freq=440', ...] -> {'freq': 440, ...}"""
+    out = {}
+    for p in pairs:
+        if "=" not in p:
+            raise SystemExit(f"expected key=value, got {p!r}")
+        k, v = p.split("=", 1)
+        try:
+            out[k] = int(v)
+        except ValueError:
+            try:
+                out[k] = float(v)
+            except ValueError:
+                raise SystemExit(f"value must be a number: {p!r}")
+    return out
+
+
+def fmt_tree(node, indent=0):
+    pad = "  " * indent
+    if node["type"] == "synth":
+        ctl = node.get("controls") or {}
+        extra = " " + " ".join(f"{k}={v}" for k, v in ctl.items()) if ctl else ""
+        return [f"{pad}#{node['id']} {node['def']}{extra}"]
+    lines = [f"{pad}group {node['id']} ({len(node['children'])} children)"]
+    for c in node["children"]:
+        lines.extend(fmt_tree(c, indent + 1))
+    return lines
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def cmd_status(c, a):
+    st = c.status()
+    if st is None:
+        print("no reply from server -- is scsynth running?", file=sys.stderr)
+        return 1
+    for k, v in st.items():
+        print(f"{k:16} {v}")
+    print(f"{'numNodes':16} {st['numSynths'] + st['numGroups']}")
+    return 0
+
+
+def cmd_tree(c, a):
+    node = c.query_tree(a.group, 1 if a.controls else 0)
+    if node is None:
+        print("no /g_queryTree reply -- is scsynth running?", file=sys.stderr)
+        return 1
+    for line in fmt_tree(node):
+        print(line)
+    return 0
+
+
+def cmd_defs(c, a):
+    if a.action == "load":
+        d = a.dir
+        if not os.path.isdir(d):
+            print(f"no such directory: {d}", file=sys.stderr)
+            return 1
+        n = len([f for f in os.listdir(d) if f.endswith(".scsyndef")])
+        if n == 0:
+            print(f"no .scsyndef files in {d} (compile them first)", file=sys.stderr)
+            return 1
+        c.send("/d_loadDir", d)
+        ok = c.sync()
+        print(f"loaded {n} synthdef(s) from {d}" if ok else "load failed (no /done)")
+        return 0 if ok else 1
+
+    # compile: run sclang over a .scd that writes .scsyndef files
+    src, outdir = a.file, a.dir
+    if not os.path.isfile(src):
+        print(f"no such file: {src}", file=sys.stderr)
+        return 1
+    os.makedirs(outdir, exist_ok=True)
+    sclang = os.environ.get("SCLANG", os.path.expanduser("~/dev/supercollider/build/lang/sclang"))
+    wrapper = f'{src}.compile.scd'
+    # The source writes its own .scsyndef files using ~defsOutDir, which we set
+    # here so `sccli defs compile defs/tone.scd` puts them next to the CLI.
+    with open(wrapper, "w") as f:
+        f.write(
+            '(\n'
+            f'~defsOutDir = "{os.path.abspath(outdir)}";\n'
+            f'thisProcess.interpreter.executeFile("{os.path.abspath(src)}");\n'
+            '"COMPILED".postln;\n'
+            '0.exit;\n)\n'
+        )
+    try:
+        r = subprocess.run([sclang, wrapper], capture_output=True, text=True, timeout=120)
+    finally:
+        os.remove(wrapper)
+    if "COMPILED" not in r.stdout:
+        print("sclang compile failed:", file=sys.stderr)
+        print((r.stdout + r.stderr)[-1200:], file=sys.stderr)
+        return 1
+    made = [f for f in os.listdir(outdir) if f.endswith(".scsyndef")]
+    print(f"compiled {len(made)} synthdef(s) into {outdir}: {', '.join(sorted(made))}")
+    return 0
+
+
+def cmd_play(c, a):
+    node_id = c.play(a.defname, parse_kv(a.params), node_id=a.id,
+                    target=a.target, action=a.action)
+    print(f"#{node_id} {a.defname}" + (" " + " ".join(a.params) if a.params else ""))
+    return 0
+
+
+def cmd_set(c, a):
+    c.set_controls(a.node, parse_kv(a.params))
+    print(f"set #{a.node} " + " ".join(a.params))
+    return 0
+
+
+def cmd_free(c, a):
+    c.free(a.node)
+    print(f"freed #{a.node}")
+    return 0
+
+
+def cmd_free_all(c, a):
+    c.free_all()
+    print("freed all nodes")
+    return 0
+
+
+def _coerce(tok):
+    """Best-effort numeric coercion for CLI-supplied OSC arguments."""
+    try:
+        return int(tok)
+    except ValueError:
+        pass
+    try:
+        return float(tok)
+    except ValueError:
+        return tok
+
+
+def cmd_send(c, a):
+    """Escape hatch: send a raw OSC message. Address '#57' = integer command 57."""
+    addr = int(a.address[1:]) if a.address.startswith("#") else a.address
+    args = []
+    for tok in a.args:
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            args.extend([k, _coerce(v)])
+        else:
+            args.append(_coerce(tok))
+    for raddr, rargs in c.request(addr, *args, window=0.6):
+        print(raddr, rargs)
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="sccli", description="OSC control surface for a running scsynth")
+    p.add_argument("--host", default=DEFAULT_HOST)
+    p.add_argument("--port", type=int, default=DEFAULT_PORT)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("status", help="server status"); sp.set_defaults(fn=cmd_status)
+    sp = sub.add_parser("tree", help="show the node tree")
+    sp.add_argument("--group", type=int, default=0)
+    sp.add_argument("--controls", action="store_true")
+    sp.set_defaults(fn=cmd_tree)
+
+    sp = sub.add_parser("defs", help="compile / load SynthDefs")
+    sp.add_argument("action", choices=["compile", "load"])
+    sp.add_argument("file", nargs="?", help="source .scd (compile only)")
+    sp.add_argument("--dir", default=os.path.join(REPO, "defs", "compiled"))
+    sp.set_defaults(fn=cmd_defs)
+
+    sp = sub.add_parser("play", help="create a synth")
+    sp.add_argument("defname")
+    sp.add_argument("params", nargs="*", help="key=value ...")
+    sp.add_argument("--id", type=int)
+    sp.add_argument("--target", type=int, default=0)
+    sp.add_argument("--action", type=int, default=0)
+    sp.set_defaults(fn=cmd_play)
+
+    sp = sub.add_parser("set", help="set synth controls")
+    sp.add_argument("node", type=int)
+    sp.add_argument("params", nargs="+")
+    sp.set_defaults(fn=cmd_set)
+
+    sp = sub.add_parser("free", help="free a node")
+    sp.add_argument("node", type=int)
+    sp.set_defaults(fn=cmd_free)
+
+    sp = sub.add_parser("free-all", help="free every node")
+    sp.set_defaults(fn=cmd_free_all)
+
+    sp = sub.add_parser("send", help="raw OSC escape hatch")
+    sp.add_argument("address")
+    sp.add_argument("args", nargs="*")
+    sp.set_defaults(fn=cmd_send)
+
+    a = p.parse_args()
+    return a.fn(SCClient(a.host, a.port), a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

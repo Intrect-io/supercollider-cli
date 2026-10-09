@@ -1,0 +1,10 @@
+name: Constitution Gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  gate:
+    uses: unohee/ci-templates/.github/workflows/constitution-gate.yml@main
